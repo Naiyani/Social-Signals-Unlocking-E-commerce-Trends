@@ -1,0 +1,111 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+import json
+import requests
+from sqlalchemy import Table, Column, String, MetaData, create_engine
+
+# --- Define a sample target table schema ---
+target_metadata = MetaData()
+sample_target_table = Table(
+    "order_items",
+    target_metadata,
+    Column("order_id", String(64), primary_key=True),
+    Column("order_item_id", String(64), primary_key=True),
+    Column("product_id", String(64)),
+    Column("seller_id", String(64)),
+    Column("pickup_limit_date", String(64)),
+    Column("price", String(64)),
+    Column("shipping_cost", String(64)),
+)
+
+
+# --- API Connection Details  ---
+API_BASE_URL = "http://34.16.77.121:1515"
+API_USERNAME = "student1"
+API_PASSWORD = "pass123"
+
+# --- MySQL Database Connection Details ---
+MYSQL_HOST = "192.168.29.70"
+MYSQL_PORT = 3306
+MYSQL_DB_NAME = "STAGELOAD"
+MYSQL_USERNAME = "root"
+MYSQL_PASSWORD = "root"
+
+def fetch_order_items_from_api_callable():
+    """
+    Python callable to fetch data from the API.
+    """
+    endpoint = f"{API_BASE_URL}/order_items/"
+    print(f"Fetching data from: {endpoint}")
+    response = requests.get(endpoint, auth=(API_USERNAME, API_PASSWORD))
+    response.raise_for_status()
+    return response.text
+
+def load_order_items_to_db(ti):
+    """
+    Fetches data from XCom, connects to the target database,
+    and loads the data into a table.
+    """
+    fetched_data_json = ti.xcom_pull(task_ids='fetch_order_items_from_api_task')
+
+    if not fetched_data_json:
+        print("No data fetched. Exiting load process.")
+        return
+
+    data_to_load = [
+    row for row in data_to_load
+    if row.get("order_id") 
+    and row["order_id"] != "order_id"
+    and not row["order_id"].startswith("order_")  # optionally skip fake headers
+]
+
+    if not data_to_load:
+        print("API returned empty data. Nothing to load.")
+        return
+
+    db_url = f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB_NAME}"
+    engine = create_engine("mysql+pymysql://root:Mysql$123@host.docker.internal:3306/STAGELOAD")
+    target_metadata.create_all(engine, tables=[sample_target_table], checkfirst=True)
+
+    with engine.connect() as conn:
+    # Get unique order_ids in the new data
+     order_ids_to_delete = [row["order_id"] for row in data_to_load]
+
+    # Now insert the cleaned data
+    conn.execute(sample_target_table.insert(), data_to_load)
+
+    engine.dispose()
+    print(f"Loaded {len(data_to_load)} records into '{sample_target_table.name}'.")
+
+# Define the Airflow DAG
+with DAG(
+    dag_id='order_items_etl',
+    start_date=datetime(2023, 1, 1),
+    schedule_interval=None,
+    catchup=False,
+    tags=['data_pipeline', 'api_integration', 'mysql'],
+    doc_md="""
+    ### API to Database Data Pipeline: order_items
+    This DAG fetches order data from an API using Basic Auth and loads it into a MySQL stage table.
+    
+     API Endpoint: `/order_items/`  
+     Target Table: `order_items`
+    """
+) as dag:
+    # Task to fetch data from the API
+    fetch_order_items_from_api_task = PythonOperator(
+        task_id='fetch_order_items_from_api_task',
+        python_callable=fetch_order_items_from_api_callable,
+    )
+
+    # Task to load the fetched data into the database
+    load_order_items_to_db_task = PythonOperator(
+        task_id='load_order_items_to_db_task',
+        python_callable=load_order_items_to_db,
+        provide_context=True,
+    )
+
+    # Define the task dependencies
+    fetch_order_items_from_api_task >> load_order_items_to_db_task
+
