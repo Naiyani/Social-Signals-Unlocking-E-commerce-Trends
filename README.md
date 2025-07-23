@@ -2,8 +2,8 @@
 
 ## Project Structure:
 
--> `airflow-etl-dags/`: Contains DAGs for each API endpoint.
--> `sql/schema.sql`: Contains SQL table definitions for staging tables.
+- `airflow-etl-dags/`: Contains DAGs for each API endpoint.
+- `sql/schema.sql`: Contains SQL table definitions for staging tables.
 
 ## How to run:
 1. Copy DAG files from the airflow-etl-dags folder into your Airflow DAGs folder.
