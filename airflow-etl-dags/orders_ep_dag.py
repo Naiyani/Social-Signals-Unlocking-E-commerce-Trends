@@ -3,8 +3,9 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime
 import json
 import requests
-from sqlalchemy import Table, Column, String, MetaData, create_engine
+from sqlalchemy import Table, Column, String, MetaData, create_engine, text, DateTime, select
 from sqlalchemy.dialects.mysql import insert
+import hashlib
 
 # --- Define a sample target table schema ---
 # This section defines the structure of the table where data will be loaded.
@@ -21,6 +22,8 @@ sample_target_table = Table(
     Column("pickup_date", String(64)),
     Column("delivered_date", String(64)),
     Column("estimated_time_delivery", String(64)),
+    Column("md5_hash", String(64)),
+    Column("dv_load_timestamp", DateTime)
 )
 
 # --- API Connection Details ---
@@ -33,7 +36,20 @@ MYSQL_HOST = "192.168.29.70"
 MYSQL_PORT = 3306
 MYSQL_DB_NAME = "STAGELOAD"
 MYSQL_USERNAME = "root"
-MYSQL_PASSWORD = "root"
+MYSQL_PASSWORD = "Mysql$123"
+
+final_orders_table=Table(
+    "final_orders", target_metadata,
+    Column("order_id", String(64), primary_key=True),
+    Column("user_name", String(64)),
+    Column("order_status", String(64)),
+    Column("order_date", String(64)),
+    Column("order_approved_date", String(64)),
+    Column("pickup_date", String(64)),
+    Column("delivered_date", String(64)),
+    Column("estimated_time_delivery", String(64)),
+    Column("md5_hash", String(64)),
+)
 
 def fetch_data_from_api_callable():
     """
@@ -63,17 +79,80 @@ def load_data_to_db(ti):
         return
 
     db_url = f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB_NAME}"
-    engine = create_engine("mysql+pymysql://root:Mysql$123@host.docker.internal:3306/STAGELOAD")
+    engine = create_engine(db_url)
     target_metadata.create_all(engine, tables=[sample_target_table], checkfirst=True)
 
     with engine.connect() as conn:
+       existing_ids = set(row[0] for row in conn.execute(select(sample_target_table.c.order_id)))
+       new_data = []
+       
        for record in data_to_load:
-          stmt = insert(sample_target_table).values(**record)
-          stmt = stmt.prefix_with("IGNORE")
-          conn.execute(stmt)
+            if record["order_id"] in existing_ids:
+                continue
+            row_string = "|".join(str(record.get(k, "")) for k in [
+                "order_id", "user_name", "order_status",
+                "order_date", "order_approved_date", "pickup_date",
+                "delivered_date","estimated_time_delivery"
+            ])
+            record["md5_hash"] = hashlib.md5(row_string.encode()).hexdigest()
+            record["dv_load_timestamp"] = datetime.now()
+            new_data.append(record) 
+        
+       if new_data:
+            conn.execute(sample_target_table.insert(), new_data)
+            print(f"Inserted {len(new_data)} new records.")
+       else:
+            print("No new records to insert.")
 
     engine.dispose()
     print(f"Loaded {len(data_to_load)} records into '{sample_target_table.name}'.")
+
+def move_orders_to_final():
+    engine = create_engine(f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB_NAME}")
+    
+    metadata=MetaData()
+    duplicate_archive_table=Table(
+        "order_duplicate_archive",
+        metadata,
+        autoload_with=engine
+    )
+
+    target_metadata.create_all(engine, tables=[final_orders_table, duplicate_archive_table])
+
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT * FROM orders"))
+        rows = result.fetchall()
+
+        for row in rows:
+            md5_val = row["md5_hash"]
+            check_query = text("""
+                SELECT COUNT(*) FROM final_orders
+                WHERE MD5(CONCAT_WS('|', order_id, user_name, order_status,
+                order_date, order_approved_date, pickup_date,
+                delivered_date,estimated_time_delivery)) = :md5
+            """)
+            exists = conn.execute(check_query, {"md5": md5_val}).scalar()
+
+            if exists:
+                archive_stmt = insert(duplicate_archive_table).values(row._asdict())
+                conn.execute(archive_stmt)
+            else:
+                final_stmt = insert(final_orders_table).values({
+                    "order_id": row["order_id"],
+                    "user_name": row["user_name"],
+                    "order_status": row["order_status"],
+                    "order_date": row["order_date"],
+                    "order_approved_date": row["order_approved_date"],
+                    "pickup_date": row["pickup_date"],
+                    "delivered_date": row["delivered_date"],
+                    "estimated_time_delivery": row["estimated_time_delivery"],
+                }).prefix_with("IGNORE")
+                conn.execute(final_stmt)
+
+            
+
+    engine.dispose()
+    print("Finished moving unique records to 'orders' and duplicates to 'order_duplicate_archive'.")
 
 # Define the Airflow DAG
 with DAG(
@@ -103,5 +182,9 @@ with DAG(
         provide_context=True,
     )
 
+    move_orders_to_final_task = PythonOperator(
+        task_id='move_orders_to_final_task',
+        python_callable=move_orders_to_final
+    )
     # Define the task dependencies
-    fetch_data_from_api_task >> load_data_to_db_task
+    fetch_data_from_api_task >> load_data_to_db_task >> move_orders_to_final_task
