@@ -117,39 +117,36 @@ def move_orders_to_final():
         autoload_with=engine
     )
 
-    target_metadata.create_all(engine, tables=[final_orders_table, duplicate_archive_table])
+    final_table = metadata.tables['final_orders']
+    staging_table = metadata.tables['orders']
+    duplicate_archive_table = metadata.tables['order_duplicate_archive']
 
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT * FROM orders"))
+        result = conn.execute(select([staging_table]))
         rows = result.fetchall()
 
         for row in rows:
-            md5_val = row["md5_hash"]
-            check_query = text("""
-                SELECT COUNT(*) FROM final_orders
-                WHERE MD5(CONCAT_WS('|', order_id, user_name, order_status,
-                order_date, order_approved_date, pickup_date,
-                delivered_date,estimated_time_delivery)) = :md5
-            """)
-            exists = conn.execute(check_query, {"md5": md5_val}).scalar()
+            row_dict = dict(row)
+            order_id = row_dict.get('order_id')
 
-            if exists:
-                archive_stmt = insert(duplicate_archive_table).values(row._asdict())
-                conn.execute(archive_stmt)
+            # Checking if orders already exists in final table
+            exists_query = select([final_table]).where(final_table.c.order_id == order_id)
+            final_result = conn.execute(exists_query).fetchone()
+
+            if final_result:
+                # Checking if already archived to avoid duplicates insert
+                archive_check = select([duplicate_archive_table]).where(
+                    duplicate_archive_table.c.order_id == order_id
+                )
+                archived = conn.execute(archive_check).fetchone()
+
+                if not archived:
+                    # Inserting into archive table
+                    conn.execute(insert(duplicate_archive_table).values(row_dict))
             else:
-                final_stmt = insert(final_orders_table).values({
-                    "order_id": row["order_id"],
-                    "user_name": row["user_name"],
-                    "order_status": row["order_status"],
-                    "order_date": row["order_date"],
-                    "order_approved_date": row["order_approved_date"],
-                    "pickup_date": row["pickup_date"],
-                    "delivered_date": row["delivered_date"],
-                    "estimated_time_delivery": row["estimated_time_delivery"],
-                }).prefix_with("IGNORE")
-                conn.execute(final_stmt)
+                # Inserting into final table
+                conn.execute(insert(final_table).values(row_dict))
 
-            
 
     engine.dispose()
     print("Finished moving unique records to 'orders' and duplicates to 'order_duplicate_archive'.")
