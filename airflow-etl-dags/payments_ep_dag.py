@@ -3,7 +3,9 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime
 import json
 import requests
-from sqlalchemy import Table, Column, String, MetaData, create_engine
+from sqlalchemy import Table, Column, String, MetaData,text,DateTime,select, create_engine
+import hashlib
+from sqlalchemy.dialects.mysql import insert
 
 # --- Define a sample target table schema ---
 # This section defines the structure of the table where data will be loaded.
@@ -16,6 +18,8 @@ sample_target_table = Table(
     Column("payment_type", String(64)),
     Column("payment_installments", String(64)),
     Column("payment_value", String(64)),
+    Column("md5_hash", String(64)),
+    Column("dv_load_timestamp", DateTime)
 )
 
 
@@ -25,11 +29,22 @@ API_USERNAME = "student1"
 API_PASSWORD = "pass123"
 
 # --- MySQL Database Connection Details ---
-MYSQL_HOST = "192.168.29.70"
+MYSQL_HOST = "host.docker.internal"
 MYSQL_PORT = 3306
-MYSQL_DB_NAME = "STAGELOAD"
 MYSQL_USERNAME = "root"
-MYSQL_PASSWORD = "root"
+MYSQL_PASSWORD = "Mysql$123"
+MYSQL_DB_NAME = "STAGELOAD"
+
+final_payments_table = Table(
+    "final_payments",
+    target_metadata,
+    Column("order_id", String(64), primary_key=True),
+    Column("payment_sequential", String(64), primary_key=True),
+    Column("payment_type", String(64)),
+    Column("payment_installments", String(64)),
+    Column("payment_value", String(64)),
+    Column("md5_hash", String(64)),
+)
 
 def fetch_payments_from_api_callable():
     """
@@ -59,14 +74,74 @@ def load_payments_to_db(ti):
         return
 
     db_url = f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB_NAME}"
-    engine = create_engine("mysql+pymysql://root:Mysql$123@host.docker.internal:3306/STAGELOAD")
+    engine = create_engine(db_url)
     target_metadata.create_all(engine, tables=[sample_target_table], checkfirst=True)
 
     with engine.connect() as conn:
-        conn.execute(sample_target_table.insert(), data_to_load)
+        existing_ids = set(row[0] for row in conn.execute(select(sample_target_table.c.order_id)))
+        new_data = []
+        for record in data_to_load: 
+            record_key = f"{record['order_id']}|{record['payment_sequential']}"
+            if record_key in existing_ids:
+                  continue
+            row_string = "|".join(str(record.get(k, "")) for k in [
+                       "order_id","payment_sequential","payment_type","payment_installments","payment_value",
+                       "price","shipping_cost"
+        ])
+    
+            record["md5_hash"] = hashlib.md5(row_string.encode()).hexdigest()
+            record["dv_load_timestamp"] = datetime.now()
+            new_data.append(record) 
+        
+        if new_data:
+            conn.execute(sample_target_table.insert(), new_data)
+            print(f"Inserted {len(new_data)} new records.")
+        else:
+            print("No new records to insert.")
 
     engine.dispose()
     print(f"Loaded {len(data_to_load)} records into '{sample_target_table.name}'.")
+
+def move_payments_to_final():
+    engine = create_engine(f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB_NAME}")
+    
+    metadata=MetaData()
+    duplicate_archive_table=Table(
+        "payment_duplicate_archive",
+        metadata,
+        autoload_with=engine
+    )
+
+    target_metadata.create_all(engine, tables=[final_payments_table, duplicate_archive_table])
+
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT * FROM payments"))
+        rows = result.fetchall()
+
+        for row in rows:
+            md5_val = row["md5_hash"]
+            check_query = text("""
+                SELECT COUNT(*) FROM final_payments
+                WHERE MD5(CONCAT_WS('|', order_id, payment_sequential, payment_type,
+                payment_installments, payment_value)) = :md5
+            """)
+            exists = conn.execute(check_query, {"md5": md5_val}).scalar()
+
+            if exists:
+                archive_stmt = insert(duplicate_archive_table).values(row._asdict())
+                conn.execute(archive_stmt)
+            else:
+                final_stmt = insert(final_payments_table).values({
+                    "order_id": row["order_id"],
+                    "payment_sequential": row["payment_sequential"],
+                    "payment_type": row["payment_type"],
+                    "payment_installments": row["payment_installments"],
+                    "payment_value": row["payment_value"],
+                }).prefix_with("IGNORE")
+                conn.execute(final_stmt)
+
+    engine.dispose()
+    print("Finished moving unique records to 'payments' and duplicates to 'payment_duplicate_archive'.")
 
 # Define the Airflow DAG
 with DAG(
@@ -88,6 +163,11 @@ with DAG(
         task_id='fetch_payments_from_api_task',
         python_callable=fetch_payments_from_api_callable,
     )
+    
+    move_payments_to_final_task = PythonOperator(
+        task_id='move_payments_to_final_task',
+        python_callable=move_payments_to_final
+    )
 
     # Task to load the fetched data into the database
     load_payments_to_db_task = PythonOperator(
@@ -97,4 +177,4 @@ with DAG(
     )
 
     # Define the task dependencies
-    fetch_payments_from_api_task >> load_payments_to_db_task
+    fetch_payments_from_api_task >> load_payments_to_db_task >> move_payments_to_final_task
