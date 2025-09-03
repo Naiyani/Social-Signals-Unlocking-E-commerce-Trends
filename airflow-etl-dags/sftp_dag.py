@@ -1,4 +1,3 @@
-# DAGS_FOLDER/sftp_dag.py  (Python 3.7-safe)
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
@@ -7,7 +6,7 @@ from airflow.exceptions import AirflowException
 from datetime import datetime, timedelta, timezone
 import os, socket, csv, io, paramiko
 from hashlib import md5
-from typing import List, Dict, Tuple, Set  # 3.7 typing
+from typing import List, Dict, Tuple, Set 
 
 from sqlalchemy import create_engine, text
 
@@ -78,8 +77,7 @@ def parse_dt(v):
             return datetime.strptime(v, fmt)
         except ValueError:
             continue
-    return None  # leave as NULL if unparsable
-
+    return None 
 def to_int(v):
     if v is None:
         return None
@@ -87,7 +85,6 @@ def to_int(v):
     if s == "" or s.lower() == "nan":
         return None
     try:
-        # handle "3.0" as 3 as well
         return int(float(s))
     except Exception:
         return None
@@ -216,7 +213,7 @@ DATASETS = {
     ),
     "feedback": dict(
         sftp="/upload/feedback_dataset.csv",
-        stage="feedback",  # your feedback stage table is named 'feedback'
+        stage="feedback",  
         archive="feedback_duplicate_archive",
         pk_cols=["feedback_id"],
         csv_cols=[
@@ -274,7 +271,6 @@ def _upsert_stage(conn, table: str, rows: List[Dict], csv_cols: List[str]):
 #  Core loader 
 
 def _load_dataset(dataset: str, cfg: dict, chunk_size: int = 5000):
-    # allow per-dataset override (e.g., orders -> 20000)
     if "chunk_size" in cfg and isinstance(cfg["chunk_size"], int) and cfg["chunk_size"] > 0:
         chunk_size = cfg["chunk_size"]
 
@@ -288,11 +284,9 @@ def _load_dataset(dataset: str, cfg: dict, chunk_size: int = 5000):
 
         preload = cfg.get("preload_pks", True)
         if preload:
-            # small/medium tables: preload all PKs once
             existing_pks = _select_existing_pks(conn, cfg["stage"], cfg["pk_cols"])
         else:
-            existing_pks = set()  # we’ll probe per-batch
-
+            existing_pks = set() 
         seen_in_batch = set()
         batch, new_rows, dup_rows = [], [], []
 
@@ -300,7 +294,6 @@ def _load_dataset(dataset: str, cfg: dict, chunk_size: int = 5000):
             return tuple(row.get(c) for c in cfg["pk_cols"])
 
         def normalize_row(r_raw: dict) -> dict:
-            # MD5 computed on raw strings for stability
             md5_val = stable_md5(r_raw, cfg["md5_fields"])
             r = dict(r_raw)
             for col in cfg["dt_cols"]:
@@ -314,7 +307,6 @@ def _load_dataset(dataset: str, cfg: dict, chunk_size: int = 5000):
             return r
 
         def flush():
-            # write staged and archive rows
             if new_rows:
                 _upsert_stage(conn, cfg["stage"], new_rows, cfg["csv_cols"])
                 new_rows.clear()
@@ -325,9 +317,7 @@ def _load_dataset(dataset: str, cfg: dict, chunk_size: int = 5000):
         def detect_dups_and_enqueue(rows: list):
             nonlocal existing_pks, seen_in_batch
             if not preload:
-                # probe existing PKs only for the current batch
                 keys = [pk_tuple(r) for r in rows]
-                # build WHERE IN clause for the single- or multi-col PK
                 if len(cfg["pk_cols"]) == 1:
                     in_vals = tuple(k[0] for k in keys)
                     if in_vals:
@@ -339,9 +329,7 @@ def _load_dataset(dataset: str, cfg: dict, chunk_size: int = 5000):
                     else:
                         existing = set()
                 else:
-                    # multi-col PK: fall back to scanning (kept simple for now)
                     existing = set()
-                    # Optional: you can add a temp table approach if needed
                 existing_pks = existing
 
             for r in rows:
@@ -374,7 +362,6 @@ def _load_dataset(dataset: str, cfg: dict, chunk_size: int = 5000):
     print(f"[{dataset}] load complete (chunk_size={chunk_size})")
 
 #  DAG 
-
 default_args = {"retries": 3, "retry_delay": timedelta(minutes=1)}
 
 with DAG(
